@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from functools import partial
 from typing import Dict, List, Optional, Union
 
@@ -19,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core.frozen_dict import FrozenDict
-from packaging import version
+from PIL import Image
 from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
 
 from diffusers.models import FlaxAutoencoderKL, FlaxUNet2DConditionModel
@@ -29,7 +30,7 @@ from diffusers.schedulers import (
     FlaxLMSDiscreteScheduler,
     FlaxPNDMScheduler,
 )
-from diffusers.utils import deprecate, logging, replace_example_docstring
+from diffusers.utils import PIL_INTERPOLATION, logging, replace_example_docstring
 from diffusers.pipelines.pipeline_flax_utils import FlaxDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_output import FlaxStableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker_flax import FlaxStableDiffusionSafetyChecker
@@ -45,38 +46,63 @@ EXAMPLE_DOC_STRING = """
         ```py
         >>> import jax
         >>> import numpy as np
+        >>> import jax.numpy as jnp
         >>> from flax.jax_utils import replicate
         >>> from flax.training.common_utils import shard
+        >>> import requests
+        >>> from io import BytesIO
+        >>> from PIL import Image
+        >>> from diffusers import FlaxStableDiffusionImg2ImgPipeline
 
-        >>> from diffusers import FlaxStableDiffusionPipeline
 
-        >>> pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
-        ...     "runwayml/stable-diffusion-v1-5", variant="bf16", dtype=jax.numpy.bfloat16
+        >>> def create_key(seed=0):
+        ...     return jax.random.PRNGKey(seed)
+
+
+        >>> rng = create_key(0)
+
+        >>> url = "https://raw.githubusercontent.com/CompVis/stable-diffusion/main/assets/stable-samples/img2img/sketch-mountains-input.jpg"
+        >>> response = requests.get(url)
+        >>> init_img = Image.open(BytesIO(response.content)).convert("RGB")
+        >>> init_img = init_img.resize((768, 512))
+
+        >>> prompts = "A fantasy landscape, trending on artstation"
+
+        >>> pipeline, params = FlaxStableDiffusionImg2ImgPipeline.from_pretrained(
+        ...     "CompVis/stable-diffusion-v1-4",
+        ...     revision="flax",
+        ...     dtype=jnp.bfloat16,
         ... )
 
-        >>> prompt = "a photo of an astronaut riding a horse on mars"
-
-        >>> prng_seed = jax.random.PRNGKey(0)
-        >>> num_inference_steps = 50
-
         >>> num_samples = jax.device_count()
-        >>> prompt = num_samples * [prompt]
-        >>> prompt_ids = pipeline.prepare_inputs(prompt)
-        # shard inputs and rng
-
-        >>> params = replicate(params)
-        >>> prng_seed = jax.random.split(prng_seed, jax.device_count())
+        >>> rng = jax.random.split(rng, jax.device_count())
+        >>> prompt_ids, processed_image = pipeline.prepare_inputs(
+        ...     prompt=[prompts] * num_samples, image=[init_img] * num_samples
+        ... )
+        >>> p_params = replicate(params)
         >>> prompt_ids = shard(prompt_ids)
+        >>> processed_image = shard(processed_image)
 
-        >>> images = pipeline(prompt_ids, params, prng_seed, num_inference_steps, jit=True).images
-        >>> images = pipeline.numpy_to_pil(np.asarray(images.reshape((num_samples,) + images.shape[-3:])))
+        >>> output = pipeline(
+        ...     prompt_ids=prompt_ids,
+        ...     image=processed_image,
+        ...     params=p_params,
+        ...     prng_seed=rng,
+        ...     strength=0.75,
+        ...     num_inference_steps=50,
+        ...     jit=True,
+        ...     height=512,
+        ...     width=768,
+        ... ).images
+
+        >>> output_images = pipeline.numpy_to_pil(np.asarray(output.reshape((num_samples,) + output.shape[-3:])))
         ```
 """
 
 
-class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
+class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
     r"""
-    Flax-based pipeline for text-to-image generation using Stable Diffusion.
+    Flax-based pipeline for text-guided image-to-image generation using Stable Diffusion.
 
     This model inherits from [`FlaxDiffusionPipeline`]. Check the superclass documentation for the generic methods
     implemented for all pipelines (downloading, saving, running on a particular device, etc.).
@@ -118,27 +144,6 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         super().__init__()
         self.dtype = dtype
 
-        is_unet_version_less_0_9_0 = hasattr(unet.config, "_diffusers_version") and version.parse(
-            version.parse(unet.config._diffusers_version).base_version
-        ) < version.parse("0.9.0.dev0")
-        is_unet_sample_size_less_64 = hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
-        if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
-            deprecation_message = (
-                "The configuration file of the unet has set the default `sample_size` to smaller than"
-                " 64 which seems highly unlikely .If you're checkpoint is a fine-tuned version of any of the"
-                " following: \n- CompVis/stable-diffusion-v1-4 \n- CompVis/stable-diffusion-v1-3 \n-"
-                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- runwayml/stable-diffusion-v1-5"
-                " \n- runwayml/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
-                " configuration file. Please make sure to update the config accordingly as leaving `sample_size=32`"
-                " in the config might lead to incorrect results in future versions. If you have downloaded this"
-                " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
-                " the `unet/config.json` file"
-            )
-            deprecate("sample_size<64", "1.0.0", deprecation_message, standard_warn=False)
-            new_config = dict(unet.config)
-            new_config["sample_size"] = 64
-            unet._internal_dict = FrozenDict(new_config)
-
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -150,9 +155,17 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
-    def prepare_inputs(self, prompt: Union[str, List[str]]):
+    def prepare_inputs(self, prompt: Union[str, List[str]], image: Union[Image.Image, List[Image.Image]]):
         if not isinstance(prompt, (str, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if not isinstance(image, (Image.Image, list)):
+            raise ValueError(f"image has to be of type `PIL.Image.Image` or list but is {type(image)}")
+
+        if isinstance(image, Image.Image):
+            image = [image]
+
+        processed_images = jnp.concatenate([preprocess(img, jnp.float32) for img in image])
 
         text_input = self.tokenizer(
             prompt,
@@ -161,50 +174,52 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
             truncation=True,
             return_tensors="np",
         )
-        return text_input.input_ids
+        return text_input.input_ids, processed_images
 
-    def _get_embeddings(self, prompt_ids: jnp.ndarray, params):
-        return self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
-
-    def get_embeddings(self, prompt_ids: jnp.array, params: Union[Dict, FrozenDict]):
-        return _p_get_embeddings(self, prompt_ids, params)
+    def get_timestep_start(self, num_inference_steps, strength):
+        # get the original timestep using init_timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        return t_start
 
     def _generate(
         self,
-        prompt_ids: jnp.array,
+        prompt_ids: jnp.ndarray,
+        image: jnp.ndarray,
         params: Union[Dict, FrozenDict],
         prng_seed: jax.Array,
+        start_timestep: int,
         num_inference_steps: int,
         height: int,
         width: int,
         guidance_scale: float,
-        latents: Optional[jnp.ndarray] = None,
+        noise: Optional[jnp.ndarray] = None,
         neg_prompt_ids: Optional[jnp.ndarray] = None,
-        return_latents=False,
+        prompt_embeds: Optional[jnp.ndarray] = None,
+        negative_prompt_embeds: Optional[jnp.ndarray] = None,
+        resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
+        antialias: bool = True,
     ):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        # get prompt text embeddings
-        prompt_embeds = self._get_embeddings(prompt_ids, params)
+        if prompt_embeds is None:
+            prompt_embeds = self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
 
         # TODO: currently it is assumed `do_classifier_free_guidance = guidance_scale > 1.0`
         # implement this conditional `do_classifier_free_guidance = guidance_scale > 1.0`
-        batch_size = prompt_ids.shape[0]
+        batch_size = prompt_embeds.shape[0]
 
-        max_length = prompt_ids.shape[-1]
-
-        if neg_prompt_ids is None:
-            uncond_input = self.tokenizer(
-                [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
-            ).input_ids
-        else:
-            uncond_input = neg_prompt_ids
-        negative_prompt_embeds = self.text_encoder(uncond_input, params=params["text_encoder"])[0]
+        if negative_prompt_embeds is None:
+            if neg_prompt_ids is None:
+                max_length = prompt_embeds.shape[-1]
+                uncond_input = self.tokenizer(
+                    [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
+                ).input_ids
+            else:
+                uncond_input = neg_prompt_ids
+            negative_prompt_embeds = self.text_encoder(uncond_input, params=params["text_encoder"])[0]
         context = jnp.concatenate([negative_prompt_embeds, prompt_embeds])
-
-        # Ensure model output will be `float32` before going into the scheduler
-        guidance_scale = jnp.array([guidance_scale], dtype=jnp.float32)
 
         latents_shape = (
             batch_size,
@@ -212,11 +227,27 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )
-        if latents is None:
-            latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
+        if noise is None:
+            noise = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
         else:
-            if latents.shape != latents_shape:
-                raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}")
+            if noise.shape != latents_shape:
+                raise ValueError(f"Unexpected latents shape, got {noise.shape}, expected {latents_shape}")
+
+        if image.shape[1] == self.unet.config.in_channels:
+            init_latents = image
+        else:
+            init_latent_dist = self.vae.apply({"params": params["vae"]}, image, method=self.vae.encode).latent_dist
+            init_latents = init_latent_dist.sample(key=prng_seed).transpose((0, 3, 1, 2))
+            init_latents = self.vae.config.scaling_factor * init_latents
+
+        target_h = height // self.vae_scale_factor
+        target_w = width // self.vae_scale_factor
+        init_shape = init_latents.shape
+        if init_shape[2] != target_h or init_shape[3] != target_w:
+            init_latents = jax.image.resize(
+                init_latents, (*init_shape[:2], target_h, target_w),
+                method=resize_method, antialias=antialias,
+            )
 
         def loop_body(step, args):
             latents, scheduler_state = args
@@ -246,22 +277,24 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
             return latents, scheduler_state
 
         scheduler_state = self.scheduler.set_timesteps(
-            params["scheduler"], num_inference_steps=num_inference_steps, shape=latents.shape
+            params["scheduler"], num_inference_steps=num_inference_steps, shape=latents_shape
         )
+
+        latent_timestep = scheduler_state.timesteps[start_timestep : start_timestep + 1].repeat(batch_size)
+
+        latents = self.scheduler.add_noise(params["scheduler"], init_latents, noise, latent_timestep)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * params["scheduler"].init_noise_sigma
 
         if DEBUG:
             # run with python for loop
-            for i in range(num_inference_steps):
+            for i in range(start_timestep, num_inference_steps):
                 latents, scheduler_state = loop_body(i, (latents, scheduler_state))
         else:
-            latents, _ = jax.lax.fori_loop(0, num_inference_steps, loop_body, (latents, scheduler_state))
+            latents, _ = jax.lax.fori_loop(start_timestep, num_inference_steps, loop_body, (latents, scheduler_state))
 
-        if return_latents:
-            return latents
-
+        # scale and decode the image latents with vae
         latents = 1 / self.vae.config.scaling_factor * latents
         image = self.vae.apply({"params": params["vae"]}, latents, method=self.vae.decode).sample
 
@@ -271,39 +304,59 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        prompt_ids: jnp.array,
+        prompt_ids: jnp.ndarray,
+        image: jnp.ndarray,
         params: Union[Dict, FrozenDict],
         prng_seed: jax.Array,
+        strength: float = 0.8,
         num_inference_steps: int = 50,
         height: Optional[int] = None,
         width: Optional[int] = None,
         guidance_scale: Union[float, jnp.ndarray] = 7.5,
-        latents: jnp.ndarray = None,
+        noise: jnp.ndarray = None,
         neg_prompt_ids: jnp.ndarray = None,
+        prompt_embeds: Optional[jnp.ndarray] = None,
+        negative_prompt_embeds: Optional[jnp.ndarray] = None,
+        resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
+        antialias: bool = True,
         return_dict: bool = True,
-        output_type: str = None,
         jit: bool = False,
     ):
         r"""
         The call function to the pipeline for generation.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt_ids (`jnp.ndarray`):
                 The prompt or prompts to guide image generation.
+            image (`jnp.ndarray`):
+                Array representing an image batch to be used as the starting point.
+            params (`Dict` or `FrozenDict`):
+                Dictionary containing the model parameters/weights.
+            prng_seed (`jax.Array` or `jax.Array`):
+                Array containing random number generator key.
+            strength (`float`, *optional*, defaults to 0.8):
+                Indicates extent to transform the reference `image`. Must be between 0 and 1. `image` is used as a
+                starting point and more noise is added the higher the `strength`. The number of denoising steps depends
+                on the amount of noise initially added. When `strength` is 1, added noise is maximum and the denoising
+                process runs for the full number of iterations specified in `num_inference_steps`. A value of 1
+                essentially ignores `image`.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference. This parameter is modulated by `strength`.
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The width in pixels of the generated image.
-            num_inference_steps (`int`, *optional*, defaults to 50):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 A higher guidance scale value encourages the model to generate images closely linked to the text
                 `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
-            latents (`jnp.ndarray`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                array is generated by sampling using the supplied random `generator`.
+            noise (`jnp.ndarray`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. The array is generated by
+                sampling using the supplied random `generator`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.FlaxStableDiffusionPipelineOutput`] instead of
+                a plain tuple.
             jit (`bool`, defaults to `False`):
                 Whether to run `pmap` versions of the generation and safety scoring functions.
 
@@ -313,10 +366,6 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
                     future release.
 
                     </Tip>
-
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~pipelines.stable_diffusion.FlaxStableDiffusionPipelineOutput`] instead of
-                a plain tuple.
 
         Examples:
 
@@ -339,34 +388,44 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
                 # Assume sharded
                 guidance_scale = guidance_scale[:, None]
 
-        return_latents = output_type == "latent"
+        start_timestep = self.get_timestep_start(num_inference_steps, strength)
 
         if jit:
             images = _p_generate(
                 self,
                 prompt_ids,
+                image,
                 params,
                 prng_seed,
+                start_timestep,
                 num_inference_steps,
                 height,
                 width,
                 guidance_scale,
-                latents,
+                noise,
                 neg_prompt_ids,
-                return_latents,
+                prompt_embeds,
+                negative_prompt_embeds,
+                resize_method,
+                antialias,
             )
         else:
             images = self._generate(
                 prompt_ids,
+                image,
                 params,
                 prng_seed,
+                start_timestep,
                 num_inference_steps,
                 height,
                 width,
                 guidance_scale,
-                latents,
+                noise,
                 neg_prompt_ids,
-                return_latents,
+                prompt_embeds,
+                negative_prompt_embeds,
+                resize_method,
+                antialias,
             )
 
         images = np.asarray(images)
@@ -378,51 +437,54 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         return FlaxStableDiffusionPipelineOutput(images=images, nsfw_content_detected=has_nsfw_concept)
 
 
-# Static argnums are pipe, num_inference_steps, height, width. A change would trigger recompilation.
+# Static argnums are pipe, start_timestep, num_inference_steps, height, width. A change would trigger recompilation.
 # Non-static args are (sharded) input tensors mapped over their first dimension (hence, `0`).
 @partial(
     jax.pmap,
-    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, None),
-    static_broadcasted_argnums=(0, 4, 5, 6, 10),
+    in_axes=(None, 0, 0, 0, 0, None, None, None, None, 0, 0, 0, 0, 0, None, None),
+    static_broadcasted_argnums=(0, 5, 6, 7, 8, 14, 15),
 )
 def _p_generate(
     pipe,
     prompt_ids,
+    image,
     params,
     prng_seed,
+    start_timestep,
     num_inference_steps,
     height,
     width,
     guidance_scale,
-    latents,
+    noise,
     neg_prompt_ids,
-    return_latents,
+    prompt_embeds,
+    negative_prompt_embeds,
+    resize_method,
+    antialias,
 ):
     return pipe._generate(
         prompt_ids,
+        image,
         params,
         prng_seed,
+        start_timestep,
         num_inference_steps,
         height,
         width,
         guidance_scale,
-        latents,
+        noise,
         neg_prompt_ids,
-        return_latents,
+        prompt_embeds,
+        negative_prompt_embeds,
+        resize_method,
+        antialias,
     )
 
 
-@partial(
-    jax.pmap,
-    in_axes=(None, 0, 0),
-    static_broadcasted_argnums=(0,),
-)
-def _p_get_embeddings(
-    pipe,
-    prompt_ids,
-    params,
-):
-    return pipe._get_embeddings(
-        prompt_ids,
-        params,
-    )
+def preprocess(image, dtype):
+    w, h = image.size
+    w, h = (x - x % 32 for x in (w, h))  # resize to integer multiple of 32
+    image = image.resize((w, h), resample=PIL_INTERPOLATION["lanczos"])
+    image = jnp.array(image).astype(dtype) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    return 2.0 * image - 1.0

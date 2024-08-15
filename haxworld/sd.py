@@ -1,4 +1,5 @@
-from typing import Dict, Union, List, Optional, Literal
+from typing import Dict, Union, List, Optional, Literal, Tuple
+from numbers import Number
 import copy
 
 import numpy as np
@@ -15,6 +16,7 @@ from flax.traverse_util import flatten_dict
 import torch
 
 from haxworld.pipelines.stable_diffusion import FlaxStableDiffusionPipeline
+from haxworld.pipelines.stable_diffusion_img2img import FlaxStableDiffusionImg2ImgPipeline
 from haxworld.pipelines.stable_diffusion_xl import FlaxStableDiffusionXLPipeline
 from haxworld.conversion import key_to_flax, tensor_to_flax, lora_key_to_hf_param, lora_key_to_alpha
 
@@ -100,9 +102,20 @@ class StableDiffusion:
         if variant == "sd":
             pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
                 pretrained_model_name_or_path, **kwargs)
+            upscaler = FlaxStableDiffusionImg2ImgPipeline(
+                vae=pipeline.vae,
+                text_encoder=pipeline.text_encoder,
+                tokenizer=pipeline.tokenizer,
+                unet=pipeline.unet,
+                scheduler=pipeline.scheduler,
+                safety_checker=None,
+                feature_extractor=pipeline.feature_extractor,
+                dtype=pipeline.dtype,                
+            )
         elif variant == "sdxl":
             pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(
                 pretrained_model_name_or_path, split_head_dim=True, **kwargs)
+            upscaler = None
 
         scheduler_state = params.pop("scheduler")
         if scheduler is not None:
@@ -117,6 +130,9 @@ class StableDiffusion:
             scheduler, scheduler_state = scheduler_cls.from_pretrained(
                 pretrained_model_name_or_path, subfolder="scheduler")
             pipeline.scheduler = scheduler
+            if upscaler is not None:
+                upscaler.scheduler = scheduler_cls.from_pretrained(
+                    pretrained_model_name_or_path, subfolder="scheduler")[0]
 
         params = jax.tree.map(lambda x: x.astype(dtype), params)
         scheduler_state = jax.tree.map(lambda x: x.astype(jnp.float32), scheduler_state)
@@ -128,6 +144,7 @@ class StableDiffusion:
         
         self.variant = variant
         self.pipeline = pipeline
+        self.upscaler = upscaler
         self.params = params
         self.p_params = replicate(params)
         self.num_devices = jax.local_device_count()
@@ -166,12 +183,29 @@ class StableDiffusion:
     def generate(
         self,
         prompt,
-        height=None,
-        width=None,
+        height,
+        width,
         num_inference_steps=25,
         guidance_scale=7.5,
         negative_prompt=None,
-        seed=None):
+        seed=None,
+        upscale: Union[bool, Number, Tuple[Number, Number]] = False,
+        upscale_steps: int = 20,
+        resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
+        denoising_strength: float = 0.7,
+        antialias: bool = True,
+    ):
+        do_upscale = False
+        if upscale is not False:
+            do_upscale = True
+            assert self.upscaler is not None
+            if upscale is True:
+                upscale = 2.0
+            if isinstance(upscale, Number):
+                upscale_h = upscale_w = upscale
+            else:
+                upscale_h, upscale_w = upscale
+
         prompt_ids, neg_prompt_ids = tokenize_prompt(self.pipeline, prompt, negative_prompt)
         rng = self._get_rng(seed)
         prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, rng, self.num_devices)
@@ -184,8 +218,26 @@ class StableDiffusion:
             num_inference_steps=num_inference_steps,
             neg_prompt_ids=neg_prompt_ids,
             guidance_scale=guidance_scale,
+            output_type="latent" if do_upscale else "pil",
             jit=True,
         ).images
+
+        if do_upscale:
+            images = self.upscaler(
+                prompt_ids,
+                images,
+                self.p_params,
+                rng,
+                denoising_strength,
+                num_inference_steps=int(upscale_steps / denoising_strength) + 1,
+                height=int(height * upscale_h),
+                width=int(width * upscale_w),
+                guidance_scale=guidance_scale,
+                neg_prompt_ids=neg_prompt_ids,
+                resize_method=resize_method,
+                antialias=antialias,
+                jit=True,
+            ).images
 
         # convert the images to PIL
         images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])

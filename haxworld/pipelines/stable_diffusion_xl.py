@@ -85,66 +85,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         inputs = jnp.stack(inputs, axis=1)
         return inputs
 
-    def __call__(
-        self,
-        prompt_ids: jax.Array,
-        params: Union[Dict, FrozenDict],
-        prng_seed: jax.Array,
-        num_inference_steps: int = 50,
-        guidance_scale: Union[float, jax.Array] = 7.5,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        latents: jnp.array = None,
-        neg_prompt_ids: jnp.array = None,
-        return_dict: bool = True,
-        output_type: str = None,
-        jit: bool = False,
-    ):
-        # 0. Default height and width to unet
-        height = height or self.unet.config.sample_size * self.vae_scale_factor
-        width = width or self.unet.config.sample_size * self.vae_scale_factor
-
-        if isinstance(guidance_scale, float) and jit:
-            # Convert to a tensor so each device gets a copy.
-            guidance_scale = jnp.array([guidance_scale] * prompt_ids.shape[0])
-            guidance_scale = guidance_scale[:, None]
-
-        return_latents = output_type == "latent"
-
-        if jit:
-            images = _p_generate(
-                self,
-                prompt_ids,
-                params,
-                prng_seed,
-                num_inference_steps,
-                height,
-                width,
-                guidance_scale,
-                latents,
-                neg_prompt_ids,
-                return_latents,
-            )
-        else:
-            images = self._generate(
-                prompt_ids,
-                params,
-                prng_seed,
-                num_inference_steps,
-                height,
-                width,
-                guidance_scale,
-                latents,
-                neg_prompt_ids,
-                return_latents,
-            )
-
-        if not return_dict:
-            return (images,)
-
-        return FlaxStableDiffusionXLPipelineOutput(images=images)
-
-    def get_embeddings(self, prompt_ids: jnp.array, params):
+    def get_embeddings(self, prompt_ids: jnp.ndarray, params):
         # We assume we have the two encoders
 
         # bs, encoder_input, seq_length
@@ -168,15 +109,15 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
 
     def _generate(
         self,
-        prompt_ids: jnp.array,
+        prompt_ids: jnp.ndarray,
         params: Union[Dict, FrozenDict],
         prng_seed: jax.Array,
         num_inference_steps: int,
         height: int,
         width: int,
         guidance_scale: float,
-        latents: Optional[jnp.array] = None,
-        neg_prompt_ids: Optional[jnp.array] = None,
+        latents: Optional[jnp.ndarray] = None,
+        neg_prompt_ids: Optional[jnp.ndarray] = None,
         return_latents=False,
     ):
         if height % 8 != 0 or width % 8 != 0:
@@ -266,12 +207,74 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         if return_latents:
             return latents
 
-        # Decode latents
         latents = 1 / self.vae.config.scaling_factor * latents
         image = self.vae.apply({"params": params["vae"]}, latents, method=self.vae.decode).sample
 
         image = (image / 2 + 0.5).clip(0, 1).transpose(0, 2, 3, 1)
         return image
+
+
+    def __call__(
+        self,
+        prompt_ids: jax.Array,
+        params: Union[Dict, FrozenDict],
+        prng_seed: jax.Array,
+        num_inference_steps: int = 50,
+        guidance_scale: Union[float, jax.Array] = 7.5,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        latents: jnp.ndarray = None,
+        neg_prompt_ids: jnp.ndarray = None,
+        return_dict: bool = True,
+        output_type: str = None,
+        jit: bool = False,
+    ):
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        if isinstance(guidance_scale, float) and jit:
+            # Convert to a tensor so each device gets a copy. Follow the prompt_ids for
+            # shape information, as they may be sharded (when `jit` is `True`), or not.
+            guidance_scale = jnp.array([guidance_scale] * prompt_ids.shape[0])
+            if len(prompt_ids.shape) > 2:
+                # Assume sharded
+                guidance_scale = guidance_scale[:, None]
+
+        return_latents = output_type == "latent"
+
+        if jit:
+            images = _p_generate(
+                self,
+                prompt_ids,
+                params,
+                prng_seed,
+                num_inference_steps,
+                height,
+                width,
+                guidance_scale,
+                latents,
+                neg_prompt_ids,
+                return_latents,
+            )
+        else:
+            images = self._generate(
+                prompt_ids,
+                params,
+                prng_seed,
+                num_inference_steps,
+                height,
+                width,
+                guidance_scale,
+                latents,
+                neg_prompt_ids,
+                return_latents,
+            )
+
+        if not return_dict:
+            return (images,)
+
+        return FlaxStableDiffusionXLPipelineOutput(images=images)
 
 
 # Static argnums are pipe, num_inference_steps, height, width, return_latents. A change would trigger recompilation.
