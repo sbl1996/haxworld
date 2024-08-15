@@ -1,62 +1,22 @@
-from typing import Dict, Union
+from typing import Dict, Union, List, Optional, Literal
+import copy
 
 import numpy as np
 
 import jax
 import jax.numpy as jnp
 
+from diffusers.loaders import StableDiffusionLoraLoaderMixin
+from diffusers import FlaxPNDMScheduler, FlaxDDIMScheduler, FlaxDPMSolverMultistepScheduler
+
 from flax.jax_utils import replicate
 from flax.traverse_util import flatten_dict
+
+import torch
+
 from haxworld.pipelines.stable_diffusion import FlaxStableDiffusionPipeline
-
-_conversion_map = [
-    ("to_q", "query"),
-    ("to_k", "key"),
-    ("to_v", "value"),
-    ("to_out_0", "proj_attn"),
-]
-
-def key_to_flax(k):
-    if "embeddings" in k:
-        k = k.replace(".weight", ".embedding")
-    elif "norm" in k:
-        k = k.replace(".weight", ".scale")
-    if not k.startswith("text_encoder"):
-        for i in range(10):
-            k = k.replace(f".{i}.", f"_{i}.")
-    if k.startswith("vae"):
-        for s1, s2 in _conversion_map:
-            k = k.replace(s1, s2)
-    return k.replace(".weight", ".kernel")
-
-
-def tensor_to_flax(k, v):
-    if k.endswith("kernel"):
-        shape = v.shape
-        if len(shape) == 2:
-            v = v.T
-        elif len(shape) == 4:
-            v = v.transpose(2, 3, 1, 0)
-    return v
-
-
-# def tensor_to_flax(k, shape):
-#     if k.endswith("kernel"):
-#         if len(shape) == 2:
-#             shape = (shape[1], shape[0])
-#         elif len(shape) == 4:
-#             shape = (shape[2], shape[3], shape[1], shape[0])
-#     return shape
-def lora_key_to_hf_param(k):
-    if k.startswith("text_encoder"):
-        name1 = "lora_linear_layer"
-        name2 = "_lora"
-        if name1 in k:
-            k = k.replace(f"{name1}.down")
-            k = k.replace(f"{name1}.up")
-        elif name2 in k:
-            pass
-    return k
+from haxworld.pipelines.stable_diffusion_xl import FlaxStableDiffusionXLPipeline
+from haxworld.conversion import key_to_flax, tensor_to_flax, lora_key_to_hf_param, lora_key_to_alpha
 
 
 def tokenize_prompt(pipeline, prompt, neg_prompt):
@@ -83,28 +43,90 @@ str_to_dtype = {
 }
 
 
+@jax.jit
+def merge_lora(p, w, down, up, alpha):
+    rank = up.shape[1]
+    n = len(p.shape)
+    if n == 4:
+        up = up.transpose(2, 3, 0, 1)
+        down = down.transpose(2, 3, 0, 1)
+    d = up @ down
+    d = jnp.swapaxes(d, -1, -2)
+    d = (w * alpha / rank) * d
+    return d.astype(p.dtype)
+
+
+def to_numpy(t):
+    if t.dtype == torch.bfloat16:
+        return t.contiguous().view(torch.int16).numpy().view(jnp.bfloat16)
+    else:
+        return t.numpy()
+
+
+def convert_lora_to_flax(state_dict, network_alphas, params):
+    params = flatten_dict(params, sep=".")
+    lora_dict = {}
+    device = None
+    for k, v in state_dict.items():
+        if ".down." in k:
+            param_key = key_to_flax(lora_key_to_hf_param(k))
+            assert param_key in params
+            p = params[param_key]
+            if device is None:
+                device = list(p.devices())[0]
+            lora_up_key = k.replace(".down.", ".up.")
+            alpha = network_alphas[lora_key_to_alpha(k)]
+            down = jax.device_put(to_numpy(v), device)
+            up = jax.device_put(to_numpy(state_dict[lora_up_key]), device)
+            assert jax.eval_shape(merge_lora, p, 0, down, up, alpha).shape == p.shape, f"Mismatch in shape, lora: {k}, param: {param_key}"
+            lora_dict[param_key] = (down, up, alpha)
+    return lora_dict
+
+
 class StableDiffusion:
 
     def __init__(
         self,
         pretrained_model_name_or_path,
         dtype: Union[jax.typing.DTypeLike, str] = jnp.bfloat16,
+        scheduler: Optional[Literal["ddim", "pndm", "dpm_solver"]] = None,
         seed: int = 0,
+        variant: Literal["sd", "sdxl"] = "sd",
         device = None,
         **kwargs):
         if isinstance(dtype, str):
             dtype = str_to_dtype[dtype]
 
-        pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path,
-            dtype=dtype,
-            **kwargs,
-        )
-        
+        if variant == "sd":
+            pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
+                pretrained_model_name_or_path, **kwargs)
+        elif variant == "sdxl":
+            pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(
+                pretrained_model_name_or_path, split_head_dim=True, **kwargs)
+
+        scheduler_state = params.pop("scheduler")
+        if scheduler is not None:
+            if scheduler == 'dpm_solver':
+                scheduler_cls = FlaxDPMSolverMultistepScheduler
+            elif scheduler == 'pndm':
+                scheduler_cls = FlaxPNDMScheduler
+            elif scheduler == 'ddim':
+                scheduler_cls = FlaxDDIMScheduler
+            else:
+                raise ValueError(f"Unknown scheduler: {scheduler}")
+            scheduler, scheduler_state = scheduler_cls.from_pretrained(
+                pretrained_model_name_or_path, subfolder="scheduler")
+            pipeline.scheduler = scheduler
+
+        params = jax.tree.map(lambda x: x.astype(dtype), params)
+        scheduler_state = jax.tree.map(lambda x: x.astype(jnp.float32), scheduler_state)
+        params["scheduler"] = scheduler_state        
+
         if device is None:
             device = jax.local_devices()[0]
         params = jax.device_put(params, device)
         
+        self.variant = variant
         self.pipeline = pipeline
         self.params = params
         self.p_params = replicate(params)
@@ -112,6 +134,8 @@ class StableDiffusion:
         self.seed = seed
         self._gen = np.random.Generator(np.random.PCG64(seed))
         self._current_seed = self._next_seed()
+
+        self._lora = {}
     
     def _next_seed(self):
         return self._gen.integers(2**30, dtype=np.uint32)
@@ -186,6 +210,79 @@ class StableDiffusion:
         self.p_params = None
         self.params = self._set_params(self.params, params)
         self.p_params = replicate(self.params)
+
+    def load_lora_weights(
+        self, pretrained_model_name_or_path: str, adapter_name=None, **kwargs):
+        if adapter_name is None:
+            adapter_name = f"default_{len(self._lora)}"
+        if adapter_name in self._lora:
+            raise ValueError(f"Adapter {adapter_name} already exists")
+
+        if self.variant == "sdxl" and "unet_config" not in kwargs:
+            kwargs["unet_config"] = self.pipeline.unet.config
+
+        state_dict, network_alphas = StableDiffusionLoraLoaderMixin.lora_state_dict(
+            pretrained_model_name_or_path, **kwargs)
+        lora_dict = convert_lora_to_flax(state_dict, network_alphas, self.params)
+        self._lora[adapter_name] = {
+            "weight": 0.0,
+            "params": lora_dict,
+        }
+
+    def set_adapters(
+        self,
+        adapter_names: Union[List[str], str],
+        adapter_weights: Optional[Union[float, List[float]]] = None,
+    ):
+        adapter_names = [adapter_names] if isinstance(adapter_names, str) else adapter_names
+
+        if adapter_weights is None:
+            adapter_weights = 1.0
+        if not isinstance(adapter_weights, list):
+            adapter_weights = [adapter_weights] * len(adapter_names)
+
+        if len(adapter_names) != len(adapter_weights):
+            raise ValueError(
+                f"Length of adapter names {len(adapter_names)} is not equal to the length of the weights {len(adapter_weights)}"
+            )
+
+        adapter_names = copy.deepcopy(adapter_names)
+        adapter_weights = copy.deepcopy(adapter_weights)
+        for name in self._lora:
+            if name not in adapter_names:
+                adapter_names.append(name)
+                adapter_weights.append(0.0)
+
+        self.p_params = None
+        params = self.params
+        
+        weights_diff = {}
+        for name, weight in zip(adapter_names, adapter_weights):
+            weights_diff[name] = weight - self._lora[name]["weight"]
+            self._lora[name]["weight"] = weight
+
+        params_t = flatten_dict(params, sep=".")
+        for k in list(params_t.keys()):
+            p = params_t.pop(k)
+            d = 0
+            for name in adapter_names:
+                lora_p = self._lora[name]["params"].get(k, None)
+                w_diff = weights_diff[name]
+                if lora_p is not None and w_diff != 0:
+                    d += merge_lora(p, w_diff, *lora_p)
+            if not isinstance(d, int):
+                assign2(params, k, d)
+
+        self.params = params
+        self.p_params = replicate(self.params)
+
+
+def assign2(params, key, diff):
+    parts = key.split(".")
+    d = params
+    for i in range(len(parts) - 1):
+        d = d[parts[i]]
+    d[parts[-1]] += diff
 
 
 def assign_inplace(params, key, value):

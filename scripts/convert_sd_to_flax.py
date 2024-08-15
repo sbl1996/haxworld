@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import tyro
 
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
 
 @dataclass
 class Args:
@@ -14,6 +14,8 @@ class Args:
     """Path to the reference flax model repo"""
     output: str
     """Output path to save the dumped flax model"""
+    variant: Literal["sd", "sdxl"] = "sd"
+    """Variant of the model to convert, can be "sd" or "sdxl"""
     load_dtype: Literal["fp32", "fp16", "bf16"] = "fp16"
     """Data type to use for loading the torch model"""
     save_dtype: Literal["fp32", "fp16", "bf16"] = "bf16"
@@ -34,7 +36,12 @@ if __name__ == "__main__":
 
     load_dtype = str_to_dtype[args.load_dtype]
 
-    pipeline = StableDiffusionPipeline.from_single_file(
+    pipeline_cls = {
+        "sd": StableDiffusionPipeline,
+        "sdxl": StableDiffusionXLPipeline,
+    }[args.variant]
+
+    pipeline = pipeline_cls.from_single_file(
         args.source, safety_checker=None,
         torch_dtype=load_dtype,
     )
@@ -50,7 +57,10 @@ if __name__ == "__main__":
         del vae
 
     params_sd = {}
-    modules = ["text_encoder", "unet", "vae"]
+    if args.variant == "sdxl":
+        modules = ["text_encoder", "text_encoder_2", "unet", "vae"]
+    else:
+        modules = ["text_encoder", "unet", "vae"]
     for m in modules:
         d = getattr(pipeline, m).state_dict()
         for k, v in d.items():
@@ -60,6 +70,6 @@ if __name__ == "__main__":
     from jax.experimental.compilation_cache import compilation_cache as cc
     cc.set_cache_dir(os.path.expanduser("~/jax_cache"))
     from haxworld.sd import StableDiffusion
-    sd = StableDiffusion(args.flax_repo, dtype=args.save_dtype, safety_checker=None)
+    sd = StableDiffusion(args.flax_repo, dtype=args.save_dtype, variant=args.variant, safety_checker=None)
     sd.set_params(params_sd)
     sd.pipeline.save_pretrained(args.output, sd.params, safe_serialization=True)
