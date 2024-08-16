@@ -182,13 +182,14 @@ class StableDiffusion:
 
     def generate(
         self,
-        prompt,
-        height,
-        width,
-        num_inference_steps=25,
-        guidance_scale=7.5,
-        negative_prompt=None,
-        seed=None,
+        prompt: str,
+        height: int,
+        width: int,
+        num_inference_steps: int = 25,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[str] = None,
+        seed: Optional[int] = None,
+        batch_size: int = 1,
         upscale: Union[bool, Number, Tuple[Number, Number]] = False,
         upscale_steps: int = 20,
         resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
@@ -207,6 +208,10 @@ class StableDiffusion:
                 upscale_h, upscale_w = upscale
 
         prompt_ids, neg_prompt_ids = tokenize_prompt(self.pipeline, prompt, negative_prompt)
+        if batch_size != 1:
+            prompt_ids = np.tile(prompt_ids, (batch_size, 1))
+            if neg_prompt_ids is not None:
+                neg_prompt_ids = np.tile(neg_prompt_ids, (batch_size, 1))
         rng = self._get_rng(seed)
         prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, rng, self.num_devices)
         images = self.pipeline(
@@ -223,6 +228,7 @@ class StableDiffusion:
         ).images
 
         if do_upscale:
+            # TODO: reuse prompt_embeds and neg_prompt_embeds
             images = self.upscaler(
                 prompt_ids,
                 images,
