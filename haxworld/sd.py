@@ -113,6 +113,7 @@ class StableDiffusion:
                 dtype=pipeline.dtype,                
             )
         elif variant == "sdxl":
+            # TODO: support refiner (https://github.com/pcuenca/diffusers-examples/blob/main/notebooks/stable_diffusion_jax_sdxl.ipynb)
             pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(
                 pretrained_model_name_or_path, split_head_dim=True, **kwargs)
             upscaler = None
