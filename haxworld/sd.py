@@ -24,10 +24,25 @@ from haxworld.conversion import key_to_flax, tensor_to_flax, lora_key_to_hf_para
 def tokenize_prompt(pipeline, prompt, neg_prompt):
     prompt_ids = pipeline.prepare_inputs(prompt)
     if neg_prompt is not None:
-        neg_prompt = ""
         neg_prompt_ids = pipeline.prepare_inputs(neg_prompt)
     else:
         neg_prompt_ids = None
+    return prompt_ids, neg_prompt_ids
+
+
+def tokenize_prompt_long(pipeline, prompt, neg_prompt):
+    prompt_ids = pipeline.prepare_inputs(prompt, truncate=False)
+    len1 = len(prompt_ids)
+    if neg_prompt is not None:
+        neg_prompt_ids = pipeline.prepare_inputs(neg_prompt, truncate=False)
+        len2 = len(neg_prompt_ids)
+    else:
+        neg_prompt_ids = None
+        len2 = 0
+    max_len = max(len1, len2)
+    prompt_ids = pipeline.prepare_inputs(prompt, truncate=True, max_length=max_len)
+    if neg_prompt is not None:
+        neg_prompt_ids = pipeline.prepare_inputs(neg_prompt, truncate=True, max_length=max_len)
     return prompt_ids, neg_prompt_ids
 
 
@@ -196,7 +211,9 @@ class StableDiffusion:
         resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
         denoising_strength: float = 0.7,
         antialias: bool = True,
+        long_prompt: bool = False,
     ):
+        # TODO: support long prompt (compel)
         do_upscale = False
         if upscale is not False:
             do_upscale = True
@@ -208,13 +225,23 @@ class StableDiffusion:
             else:
                 upscale_h, upscale_w = upscale
 
-        prompt_ids, neg_prompt_ids = tokenize_prompt(self.pipeline, prompt, negative_prompt)
+        if long_prompt:
+            prompt_ids, neg_prompt_ids = tokenize_prompt_long(self.pipeline, prompt, negative_prompt)
+        else:
+            prompt_ids, neg_prompt_ids = tokenize_prompt(self.pipeline, prompt, negative_prompt)
+
         if batch_size != 1:
             prompt_ids = np.tile(prompt_ids, (batch_size, 1))
             if neg_prompt_ids is not None:
                 neg_prompt_ids = np.tile(neg_prompt_ids, (batch_size, 1))
         rng = self._get_rng(seed)
         prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, rng, self.num_devices)
+
+        prompt_embeds = neg_prompt_embeds = None
+        if do_upscale and prompt_embeds is None:
+            prompt_embeds = self.pipeline.get_embeddings(prompt_ids, self.p_params)
+            if neg_prompt_ids is not None:
+                neg_prompt_embeds = self.pipeline.get_embeddings(neg_prompt_ids, self.p_params)
         images = self.pipeline(
             prompt_ids,
             self.p_params,
@@ -224,6 +251,8 @@ class StableDiffusion:
             num_inference_steps=num_inference_steps,
             neg_prompt_ids=neg_prompt_ids,
             guidance_scale=guidance_scale,
+            prompt_embeds=prompt_embeds,
+            neg_prompt_embeds=neg_prompt_embeds,
             output_type="latent" if do_upscale else "pil",
             jit=True,
         ).images
@@ -241,6 +270,8 @@ class StableDiffusion:
                 width=int(width * upscale_w),
                 guidance_scale=guidance_scale,
                 neg_prompt_ids=neg_prompt_ids,
+                prompt_embeds=prompt_embeds,
+                neg_prompt_embeds=neg_prompt_embeds,
                 resize_method=resize_method,
                 antialias=antialias,
                 jit=True,

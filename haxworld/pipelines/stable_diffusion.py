@@ -15,6 +15,7 @@
 from functools import partial
 from typing import Dict, List, Optional, Union
 
+import math
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -150,24 +151,47 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
-    def prepare_inputs(self, prompt: Union[str, List[str]]):
+    def prepare_inputs(self, prompt: Union[str, List[str]], truncate=True, max_length=None):
         if not isinstance(prompt, (str, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
-        text_input = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="np",
-        )
-        return text_input.input_ids
+        if truncate:
+            l = self.tokenizer.model_max_length
+            if max_length is not None:
+                max_length = int(math.ceil(max_length / l) * l)
+            else:
+                max_length = l
+            text_input = self.tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=max_length,
+                truncation=True,
+                return_tensors="np",
+            )
+            return text_input.input_ids
+        else:
+            assert isinstance(prompt, str), f"`prompt` has to be of type `str` but is {type(prompt)} for truncate=False"
+            text_input = self.tokenizer(prompt)
+            return text_input.input_ids
 
     def _get_embeddings(self, prompt_ids: jnp.ndarray, params):
         return self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
 
-    def get_embeddings(self, prompt_ids: jnp.array, params: Union[Dict, FrozenDict]):
-        return _p_get_embeddings(self, prompt_ids, params)
+    def get_embeddings(self, prompt_ids: jnp.array, params: Union[Dict, FrozenDict], jit=True):
+        if jit:
+            func = partial(_p_get_embeddings, self)
+        else:
+            func = self._get_embeddings
+        max_length = self.tokenizer.model_max_length
+        length = prompt_ids.shape[-1]
+        if length > max_length:
+            assert length % max_length == 0
+            chunks = []
+            for i in range(length // max_length):
+                chunk = prompt_ids[..., i * max_length : (i + 1) * max_length]
+                chunks.append(func(chunk, params))
+            return jnp.concatenate(chunks, axis=-2)
+        return func(prompt_ids, params)
 
     def _generate(
         self,
@@ -180,28 +204,29 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         guidance_scale: float,
         latents: Optional[jnp.ndarray] = None,
         neg_prompt_ids: Optional[jnp.ndarray] = None,
+        prompt_embeds: Optional[jnp.ndarray] = None,
+        neg_prompt_embeds: Optional[jnp.ndarray] = None,
         return_latents=False,
     ):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        # get prompt text embeddings
-        prompt_embeds = self._get_embeddings(prompt_ids, params)
+        if prompt_embeds is None:
+            prompt_embeds = self._get_embeddings(prompt_ids, params)
 
         # TODO: currently it is assumed `do_classifier_free_guidance = guidance_scale > 1.0`
         # implement this conditional `do_classifier_free_guidance = guidance_scale > 1.0`
         batch_size = prompt_ids.shape[0]
-
-        max_length = prompt_ids.shape[-1]
-
-        if neg_prompt_ids is None:
-            uncond_input = self.tokenizer(
-                [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
-            ).input_ids
-        else:
-            uncond_input = neg_prompt_ids
-        negative_prompt_embeds = self.text_encoder(uncond_input, params=params["text_encoder"])[0]
-        context = jnp.concatenate([negative_prompt_embeds, prompt_embeds])
+        if neg_prompt_embeds is None:
+            if neg_prompt_ids is None:
+                max_length = prompt_ids.shape[-1]
+                uncond_input = self.tokenizer(
+                    [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="np"
+                ).input_ids
+            else:
+                uncond_input = neg_prompt_ids
+            neg_prompt_embeds = self._get_embeddings(uncond_input, params)
+        context = jnp.concatenate([neg_prompt_embeds, prompt_embeds])
 
         # Ensure model output will be `float32` before going into the scheduler
         guidance_scale = jnp.array([guidance_scale], dtype=jnp.float32)
@@ -280,6 +305,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
         guidance_scale: Union[float, jnp.ndarray] = 7.5,
         latents: jnp.ndarray = None,
         neg_prompt_ids: jnp.ndarray = None,
+        prompt_embeds: Optional[jnp.ndarray] = None,
+        neg_prompt_embeds: Optional[jnp.ndarray] = None,
         return_dict: bool = True,
         output_type: str = None,
         jit: bool = False,
@@ -353,6 +380,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
                 guidance_scale,
                 latents,
                 neg_prompt_ids,
+                prompt_embeds,
+                neg_prompt_embeds,
                 return_latents,
             )
         else:
@@ -366,6 +395,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
                 guidance_scale,
                 latents,
                 neg_prompt_ids,
+                prompt_embeds,
+                neg_prompt_embeds,
                 return_latents,
             )
 
@@ -382,8 +413,8 @@ class FlaxStableDiffusionPipeline(FlaxDiffusionPipeline):
 # Non-static args are (sharded) input tensors mapped over their first dimension (hence, `0`).
 @partial(
     jax.pmap,
-    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, None),
-    static_broadcasted_argnums=(0, 4, 5, 6, 10),
+    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, 0, 0, None),
+    static_broadcasted_argnums=(0, 4, 5, 6, 12),
 )
 def _p_generate(
     pipe,
@@ -396,6 +427,8 @@ def _p_generate(
     guidance_scale,
     latents,
     neg_prompt_ids,
+    prompt_embeds,
+    neg_prompt_embeds,
     return_latents,
 ):
     return pipe._generate(
@@ -408,6 +441,8 @@ def _p_generate(
         guidance_scale,
         latents,
         neg_prompt_ids,
+        prompt_embeds,
+        neg_prompt_embeds,
         return_latents,
     )
 

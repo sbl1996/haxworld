@@ -182,6 +182,25 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         t_start = max(num_inference_steps - init_timestep, 0)
         return t_start
 
+    def _get_embeddings(self, prompt_ids: jnp.ndarray, params):
+        return self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
+
+    def get_embeddings(self, prompt_ids: jnp.array, params: Union[Dict, FrozenDict], jit=True):
+        if jit:
+            func = partial(_p_get_embeddings, pipe=self)
+        else:
+            func = self._get_embeddings
+        max_length = self.tokenizer.model_max_length
+        length = prompt_ids.shape[-1]
+        if length > max_length:
+            assert length % max_length == 0
+            chunks = []
+            for i in range(length // max_length):
+                chunk = prompt_ids[..., i * max_length : (i + 1) * max_length]
+                chunks.append(func(chunk, params))
+            return jnp.concatenate(chunks, axis=-2)
+        return func(prompt_ids, params)
+
     def _generate(
         self,
         prompt_ids: jnp.ndarray,
@@ -196,7 +215,7 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         noise: Optional[jnp.ndarray] = None,
         neg_prompt_ids: Optional[jnp.ndarray] = None,
         prompt_embeds: Optional[jnp.ndarray] = None,
-        negative_prompt_embeds: Optional[jnp.ndarray] = None,
+        neg_prompt_embeds: Optional[jnp.ndarray] = None,
         resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
         antialias: bool = True,
     ):
@@ -204,13 +223,13 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
         if prompt_embeds is None:
-            prompt_embeds = self.text_encoder(prompt_ids, params=params["text_encoder"])[0]
+            prompt_embeds = self._get_embeddings(prompt_ids, params)
 
         # TODO: currently it is assumed `do_classifier_free_guidance = guidance_scale > 1.0`
         # implement this conditional `do_classifier_free_guidance = guidance_scale > 1.0`
         batch_size = prompt_embeds.shape[0]
 
-        if negative_prompt_embeds is None:
+        if neg_prompt_embeds is None:
             if neg_prompt_ids is None:
                 max_length = prompt_embeds.shape[-1]
                 uncond_input = self.tokenizer(
@@ -218,8 +237,11 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
                 ).input_ids
             else:
                 uncond_input = neg_prompt_ids
-            negative_prompt_embeds = self.text_encoder(uncond_input, params=params["text_encoder"])[0]
-        context = jnp.concatenate([negative_prompt_embeds, prompt_embeds])
+            neg_prompt_embeds = self._get_embeddings(uncond_input, params)
+        context = jnp.concatenate([neg_prompt_embeds, prompt_embeds])
+
+        # Ensure model output will be `float32` before going into the scheduler
+        guidance_scale = jnp.array([guidance_scale], dtype=jnp.float32)
 
         latents_shape = (
             batch_size,
@@ -316,7 +338,7 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
         noise: jnp.ndarray = None,
         neg_prompt_ids: jnp.ndarray = None,
         prompt_embeds: Optional[jnp.ndarray] = None,
-        negative_prompt_embeds: Optional[jnp.ndarray] = None,
+        neg_prompt_embeds: Optional[jnp.ndarray] = None,
         resize_method: Union[str, jax.image.ResizeMethod] = 'bicubic',
         antialias: bool = True,
         return_dict: bool = True,
@@ -405,7 +427,7 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
                 noise,
                 neg_prompt_ids,
                 prompt_embeds,
-                negative_prompt_embeds,
+                neg_prompt_embeds,
                 resize_method,
                 antialias,
             )
@@ -423,7 +445,7 @@ class FlaxStableDiffusionImg2ImgPipeline(FlaxDiffusionPipeline):
                 noise,
                 neg_prompt_ids,
                 prompt_embeds,
-                negative_prompt_embeds,
+                neg_prompt_embeds,
                 resize_method,
                 antialias,
             )
@@ -458,7 +480,7 @@ def _p_generate(
     noise,
     neg_prompt_ids,
     prompt_embeds,
-    negative_prompt_embeds,
+    neg_prompt_embeds,
     resize_method,
     antialias,
 ):
@@ -475,9 +497,25 @@ def _p_generate(
         noise,
         neg_prompt_ids,
         prompt_embeds,
-        negative_prompt_embeds,
+        neg_prompt_embeds,
         resize_method,
         antialias,
+    )
+
+
+@partial(
+    jax.pmap,
+    in_axes=(None, 0, 0),
+    static_broadcasted_argnums=(0,),
+)
+def _p_get_embeddings(
+    pipe,
+    prompt_ids,
+    params,
+):
+    return pipe._get_embeddings(
+        prompt_ids,
+        params,
     )
 
 
