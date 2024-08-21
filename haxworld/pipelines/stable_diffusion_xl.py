@@ -85,7 +85,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         inputs = jnp.stack(inputs, axis=1)
         return inputs
 
-    def get_embeddings(self, prompt_ids: jnp.ndarray, params):
+    def _get_embeddings(self, prompt_ids: jnp.ndarray, params):
         # We assume we have the two encoders
 
         # bs, encoder_input, seq_length
@@ -101,6 +101,12 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         text_embeds = prompt_embeds_2_out["text_embeds"]
         prompt_embeds = jnp.concatenate([prompt_embeds, prompt_embeds_2], axis=-1)
         return prompt_embeds, text_embeds
+
+    def get_embeddings(self, prompt_ids: jnp.array, params: Union[Dict, FrozenDict], jit=True):
+        if jit:
+            return _p_get_embeddings(self, prompt_ids, params)
+        else:
+            return self._get_embeddings(prompt_ids, params)
 
     def _get_add_time_ids(self, original_size, crops_coords_top_left, target_size, bs, dtype):
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
@@ -118,29 +124,33 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         guidance_scale: float,
         latents: Optional[jnp.ndarray] = None,
         neg_prompt_ids: Optional[jnp.ndarray] = None,
+        prompt_embeds: Optional[jnp.ndarray] = None,
+        neg_prompt_embeds: Optional[jnp.ndarray] = None,
+        do_classifier_free_guidance: bool = True,
         return_latents=False,
     ):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        # Encode input prompt
-        prompt_embeds, pooled_embeds = self.get_embeddings(prompt_ids, params)
+        if prompt_embeds is None:
+            prompt_embeds, add_text_embeds = self._get_embeddings(prompt_ids, params)
 
         # Get unconditional embeddings
         batch_size = prompt_embeds.shape[0]
-        if neg_prompt_ids is None:
-            neg_prompt_embeds = jnp.zeros_like(prompt_embeds)
-            negative_pooled_embeds = jnp.zeros_like(pooled_embeds)
-        else:
-            neg_prompt_embeds, negative_pooled_embeds = self.get_embeddings(neg_prompt_ids, params)
+        if neg_prompt_embeds is None:
+            if neg_prompt_ids is None:
+                neg_prompt_embeds = jnp.zeros_like(prompt_embeds)
+                negative_pooled_embeds = jnp.zeros_like(add_text_embeds)
+            else:
+                neg_prompt_embeds, negative_pooled_embeds = self._get_embeddings(neg_prompt_ids, params)
 
         add_time_ids = self._get_add_time_ids(
             (height, width), (0, 0), (height, width), prompt_embeds.shape[0], dtype=prompt_embeds.dtype
         )
-
-        prompt_embeds = jnp.concatenate([neg_prompt_embeds, prompt_embeds], axis=0)  # (2, 77, 2048)
-        add_text_embeds = jnp.concatenate([negative_pooled_embeds, pooled_embeds], axis=0)
-        add_time_ids = jnp.concatenate([add_time_ids, add_time_ids], axis=0)
+        if do_classifier_free_guidance:
+            prompt_embeds = jnp.concatenate([neg_prompt_embeds, prompt_embeds], axis=0)  # (2, 77, 2048)
+            add_text_embeds = jnp.concatenate([negative_pooled_embeds, add_text_embeds], axis=0)
+            add_time_ids = jnp.concatenate([add_time_ids, add_time_ids], axis=0)
 
         # Ensure model output will be `float32` before going into the scheduler
         guidance_scale = jnp.array([guidance_scale], dtype=jnp.float32)
@@ -174,7 +184,10 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            latents_input = jnp.concatenate([latents] * 2)
+            if do_classifier_free_guidance:
+                latents_input = jnp.concatenate([latents] * 2)
+            else:
+                latents_input = latents
 
             t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
             timestep = jnp.broadcast_to(t, latents_input.shape[0])
@@ -189,9 +202,10 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
                 encoder_hidden_states=prompt_embeds,
                 added_cond_kwargs=added_cond_kwargs,
             ).sample
-            # perform guidance
-            noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+            if do_classifier_free_guidance:
+                # perform guidance
+                noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
 
             # compute the previous noisy sample x_t -> x_t-1
             latents, scheduler_state = self.scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
@@ -220,11 +234,13 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         params: Union[Dict, FrozenDict],
         prng_seed: jax.Array,
         num_inference_steps: int = 50,
-        guidance_scale: Union[float, jax.Array] = 7.5,
+        guidance_scale: float = 7.5,
         height: Optional[int] = None,
         width: Optional[int] = None,
         latents: jnp.ndarray = None,
         neg_prompt_ids: jnp.ndarray = None,
+        prompt_embeds: Optional[jnp.ndarray] = None,
+        neg_prompt_embeds: Optional[jnp.ndarray] = None,
         return_dict: bool = True,
         output_type: str = None,
         jit: bool = False,
@@ -232,6 +248,10 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        do_classifier_free_guidance = guidance_scale > 1.0
+        if not do_classifier_free_guidance:
+            neg_prompt_ids = neg_prompt_embeds = None
 
         if isinstance(guidance_scale, float) and jit:
             # Convert to a tensor so each device gets a copy. Follow the prompt_ids for
@@ -255,6 +275,9 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
                 guidance_scale,
                 latents,
                 neg_prompt_ids,
+                prompt_embeds,
+                neg_prompt_embeds,
+                do_classifier_free_guidance,
                 return_latents,
             )
         else:
@@ -268,6 +291,9 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
                 guidance_scale,
                 latents,
                 neg_prompt_ids,
+                prompt_embeds,
+                neg_prompt_embeds,
+                do_classifier_free_guidance,
                 return_latents,
             )
 
@@ -281,8 +307,8 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
 # Non-static args are (sharded) input tensors mapped over their first dimension (hence, `0`).
 @partial(
     jax.pmap,
-    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, None),
-    static_broadcasted_argnums=(0, 4, 5, 6, 10),
+    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, 0, 0, None, None),
+    static_broadcasted_argnums=(0, 4, 5, 6, 12, 13),
 )
 def _p_generate(
     pipe,
@@ -295,6 +321,9 @@ def _p_generate(
     guidance_scale,
     latents,
     neg_prompt_ids,
+    prompt_embeds,
+    neg_prompt_embeds,
+    do_classifier_free_guidance,
     return_latents,
 ):
     return pipe._generate(
@@ -307,5 +336,24 @@ def _p_generate(
         guidance_scale,
         latents,
         neg_prompt_ids,
+        prompt_embeds,
+        neg_prompt_embeds,
+        do_classifier_free_guidance,
         return_latents,
+    )
+
+
+@partial(
+    jax.pmap,
+    in_axes=(None, 0, 0),
+    static_broadcasted_argnums=(0,),
+)
+def _p_get_embeddings(
+    pipe,
+    prompt_ids,
+    params,
+):
+    return pipe._get_embeddings(
+        prompt_ids,
+        params,
     )

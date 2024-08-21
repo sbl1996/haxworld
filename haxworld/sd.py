@@ -1,6 +1,8 @@
 from typing import Dict, Union, List, Optional, Literal, Tuple
 from numbers import Number
+import re
 import copy
+from pathlib import Path
 
 import numpy as np
 
@@ -8,7 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from diffusers.loaders import StableDiffusionLoraLoaderMixin
-from diffusers import FlaxPNDMScheduler, FlaxDDIMScheduler, FlaxDPMSolverMultistepScheduler
+from diffusers import FlaxPNDMScheduler, FlaxDDIMScheduler, FlaxDPMSolverMultistepScheduler, AutoPipelineForText2Image
 
 from flax.jax_utils import replicate
 from flax.traverse_util import flatten_dict
@@ -19,6 +21,27 @@ from haxworld.pipelines.stable_diffusion import FlaxStableDiffusionPipeline
 from haxworld.pipelines.stable_diffusion_img2img import FlaxStableDiffusionImg2ImgPipeline
 from haxworld.pipelines.stable_diffusion_xl import FlaxStableDiffusionXLPipeline
 from haxworld.conversion import key_to_flax, tensor_to_flax, lora_key_to_hf_param, lora_key_to_alpha
+
+
+def load_config(pretrained_model_or_path, **kwargs):
+    cache_dir = kwargs.pop("cache_dir", None)
+    force_download = kwargs.pop("force_download", False)
+    proxies = kwargs.pop("proxies", None)
+    token = kwargs.pop("token", None)
+    local_files_only = kwargs.pop("local_files_only", False)
+    revision = kwargs.pop("revision", None)
+
+    load_config_kwargs = {
+        "cache_dir": cache_dir,
+        "force_download": force_download,
+        "proxies": proxies,
+        "token": token,
+        "local_files_only": local_files_only,
+        "revision": revision,
+    }
+
+    config = AutoPipelineForText2Image.load_config(pretrained_model_or_path, **load_config_kwargs)
+    return config
 
 
 def tokenize_prompt(pipeline, prompt, neg_prompt):
@@ -100,6 +123,24 @@ def convert_lora_to_flax(state_dict, network_alphas, params):
     return lora_dict
 
 
+def parse_prompt(prompt):
+    # Extract all LoRA information
+    lora_matches = re.findall(r'<([\w\.]+):\s*([\d.]+)>', prompt)
+    loras = [
+        (name, float(weight))
+        for name, weight in lora_matches
+    ]
+    
+    # Remove all LoRA information from the prompt
+    prompt_without_loras = re.sub(r'<\w+:\s*[\d.]+>', '', prompt)
+    
+    # Extract keywords
+    keywords = [keyword.strip() for keyword in prompt_without_loras.split(',') if keyword.strip()]
+    
+    prompt = ",".join(keywords)
+    return prompt, loras
+
+
 class StableDiffusion:
 
     def __init__(
@@ -108,13 +149,15 @@ class StableDiffusion:
         dtype: Union[jax.typing.DTypeLike, str] = jnp.bfloat16,
         scheduler: Optional[Literal["ddim", "pndm", "dpm_solver"]] = None,
         seed: int = 0,
-        variant: Literal["sd", "sdxl"] = "sd",
         device = None,
         **kwargs):
         if isinstance(dtype, str):
             dtype = str_to_dtype[dtype]
-
-        if variant == "sd":
+        
+        config = load_config(pretrained_model_name_or_path, **kwargs)
+        cls_name = config['_class_name']
+        if cls_name == 'FlaxStableDiffusionPipeline':
+            variant = "sd"
             pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
                 pretrained_model_name_or_path, **kwargs)
             upscaler = FlaxStableDiffusionImg2ImgPipeline(
@@ -127,11 +170,14 @@ class StableDiffusion:
                 feature_extractor=pipeline.feature_extractor,
                 dtype=pipeline.dtype,                
             )
-        elif variant == "sdxl":
+        elif cls_name == 'FlaxStableDiffusionXLPipeline':
+            variant = "sdxl"
             # TODO: support refiner (https://github.com/pcuenca/diffusers-examples/blob/main/notebooks/stable_diffusion_jax_sdxl.ipynb)
             pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(
                 pretrained_model_name_or_path, split_head_dim=True, **kwargs)
             upscaler = None
+        else:
+            raise ValueError(f"Unknown pipeline class: {cls_name}")
 
         scheduler_state = params.pop("scheduler")
         if scheduler is not None:
@@ -169,6 +215,7 @@ class StableDiffusion:
         self._current_seed = self._next_seed()
 
         self._lora = {}
+        self._lora_dirs = []
     
     def _next_seed(self):
         return self._gen.integers(2**30, dtype=np.uint32)
@@ -196,6 +243,19 @@ class StableDiffusion:
             seed=default_seed,
         )
 
+    def add_lora_dir(self, lora_dir: str):
+        lora_dir = Path(lora_dir).absolute().expanduser()
+        if not lora_dir.exists():
+            raise ValueError(f"{lora_dir} does not exist")
+        if lora_dir not in self._lora_dirs:
+            self._lora_dirs.append(lora_dir)
+
+    def find_lora(self, lora_name: str):
+        for lora_dir in self._lora_dirs:
+            for f in lora_dir.glob("*.safetensors"):
+                if f.stem == lora_name:
+                    return f
+
     def generate(
         self,
         prompt: str,
@@ -213,17 +273,38 @@ class StableDiffusion:
         antialias: bool = True,
         long_prompt: bool = False,
     ):
-        # TODO: support long prompt (compel)
+        prompt, prompt_loras = parse_prompt(prompt)
+        negative_prompt = parse_prompt(negative_prompt)[0]
+
+        if prompt_loras:
+            lora_names, lora_weights = [ list(x) for x in zip(*prompt_loras) ]
+            for lora_name in lora_names:
+                if lora_name not in self._lora:
+                    lora_path = self.find_lora(lora_name)
+                    if lora_path is None:
+                        raise ValueError(f"Lora {lora_name} not found")
+                    self.load_lora_weights(lora_path, adapter_name=lora_name)
+            self.set_adapters(lora_names, adapter_weights=lora_weights)
+
+        # TODO: support prompt weighting (compel)
         do_upscale = False
-        if upscale is not False:
-            do_upscale = True
+        if upscale is False:
+            upscale = 1.0
+        if upscale is True:
+            upscale = 2.0
+        if upscale != 1.0:
             assert self.upscaler is not None
-            if upscale is True:
-                upscale = 2.0
+            do_upscale = True
             if isinstance(upscale, Number):
                 upscale_h = upscale_w = upscale
             else:
                 upscale_h, upscale_w = upscale
+
+        guidance_scale = float(guidance_scale)
+        if guidance_scale <= 1.0:
+            if negative_prompt is not None:
+                print("Warning: negative prompt is ignored when guidance_scale <= 1.0 (no classifier-free guidance)")
+                negative_prompt = None
 
         if long_prompt:
             prompt_ids, neg_prompt_ids = tokenize_prompt_long(self.pipeline, prompt, negative_prompt)
@@ -305,7 +386,8 @@ class StableDiffusion:
         self, pretrained_model_name_or_path: str, adapter_name=None, **kwargs):
         if adapter_name is None:
             adapter_name = f"default_{len(self._lora)}"
-        if adapter_name in self._lora:
+        exists_ok = kwargs.pop("exists_ok", False)
+        if adapter_name in self._lora and not exists_ok:
             raise ValueError(f"Adapter {adapter_name} already exists")
 
         if self.variant == "sdxl" and "unet_config" not in kwargs:
@@ -342,14 +424,17 @@ class StableDiffusion:
             if name not in adapter_names:
                 adapter_names.append(name)
                 adapter_weights.append(0.0)
-
-        self.p_params = None
-        params = self.params
         
         weights_diff = {}
         for name, weight in zip(adapter_names, adapter_weights):
             weights_diff[name] = weight - self._lora[name]["weight"]
             self._lora[name]["weight"] = weight
+
+        if all([w == 0.0 for w in weights_diff.values()]):
+            return
+
+        self.p_params = None
+        params = self.params
 
         params_t = flatten_dict(params, sep=".")
         for k in list(params_t.keys()):
