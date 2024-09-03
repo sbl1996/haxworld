@@ -70,6 +70,6 @@ if __name__ == "__main__":
     from jax.experimental.compilation_cache import compilation_cache as cc
     cc.set_cache_dir(os.path.expanduser("~/jax_cache"))
     from haxworld.sd import StableDiffusion
-    sd = StableDiffusion(args.flax_repo, dtype=args.save_dtype, variant=args.variant, safety_checker=None)
+    sd = StableDiffusion(args.flax_repo, dtype=args.save_dtype, safety_checker=None)
     sd.set_params(params_sd)
     sd.pipeline.save_pretrained(args.output, sd.params, safe_serialization=True)
